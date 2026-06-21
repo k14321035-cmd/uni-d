@@ -419,20 +419,40 @@ app.get("/api/download-file", (req, res) => {
   if (!fs.existsSync(filepath)) {
     return res.status(404).send("File not found or expired.");
   }
+
+  // Map extension → MIME type so Android knows what player to use
+  const mimeMap: Record<string, string> = {
+    mp4:  "video/mp4",
+    webm: "video/webm",
+    mkv:  "video/x-matroska",
+    mp3:  "audio/mpeg",
+    m4a:  "audio/mp4",
+    ogg:  "audio/ogg",
+    opus: "audio/opus",
+  };
+  const mimeType = mimeMap[safeExt.toLowerCase()] || "application/octet-stream";
   
   // Generate download filename from title
   const cleanTitle = (typeof title === 'string' ? title : 'video')
-    .replace(/[^a-zA-Z0-9\s-_]/g, '') // remove special characters
+    .replace(/[^a-zA-Z0-9\s-_]/g, '')
     .trim() || 'video';
-    
   const downloadName = `${cleanTitle}.${safeExt}`;
-  
+
+  // Set explicit headers — critical for Android DownloadManager to
+  // identify the file correctly and open it with the right app.
+  const stat = fs.statSync(filepath);
+  res.setHeader("Content-Type", mimeType);
+  res.setHeader("Content-Length", stat.size);
+  res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+  res.setHeader("Accept-Ranges", "bytes");
+
   res.download(filepath, downloadName, (err) => {
     if (err) {
       console.error("Error sending file:", err);
     }
   });
 });
+
 
 app.get("/api/downloads", (req, res) => {
   try {
