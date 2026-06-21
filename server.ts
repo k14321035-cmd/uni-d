@@ -12,6 +12,18 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json());
 
+// Allow requests from Capacitor Android (http://localhost),
+// Capacitor iOS (capacitor://localhost), and browsers (any origin).
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 const isWin = process.platform === "win32";
 const YTDLP_FILENAME = isWin ? "yt-dlp.exe" : "yt-dlp";
 const YTDLP_PATH = path.join(process.cwd(), YTDLP_FILENAME);
