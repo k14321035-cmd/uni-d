@@ -205,7 +205,7 @@ export default function App() {
     const eventSource = nativeEventSource(`/api/prepare-stream?url=${encodeURIComponent(url)}&type=${type}${titleParam}${thumbParam}`);
     activeEventSourceRef.current = eventSource;
 
-    eventSource.onmessage = (event) => {
+    eventSource.onmessage = async (event) => {
       try {
         const data = JSON.parse(event.data);
         if (data.error) {
@@ -215,8 +215,43 @@ export default function App() {
           activeEventSourceRef.current = null;
         } else if (data.downloadUrl) {
           setDownloadProgress(100);
-          setDownloadText('Starting download...');
-          window.location.href = data.downloadUrl;
+          setDownloadText('Saving file...');
+          eventSource.close();
+          activeEventSourceRef.current = null;
+
+          // Build absolute URL (required inside Capacitor WebView)
+          const absoluteUrl = apiUrl(data.downloadUrl);
+
+          try {
+            // Fetch file as blob — no page navigation, no redirect
+            const fileResp = await fetch(absoluteUrl);
+            if (!fileResp.ok) throw new Error(`Server error: ${fileResp.status}`);
+            const blob = await fileResp.blob();
+
+            // Derive a clean filename
+            const ext = type === 'audio' ? 'mp3' : 'mp4';
+            const safeName = (videoInfo?.title || 'video')
+              .replace(/[^\w\s-]/g, '')
+              .trim()
+              .substring(0, 80) || 'video';
+            const filename = `${safeName}.${ext}`;
+
+            // Create a temporary object URL and click a hidden <a download>
+            const blobUrl = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = blobUrl;
+            anchor.download = filename;
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            document.body.removeChild(anchor);
+            // Revoke after a short delay to let the browser start the download
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+          } catch (dlErr: any) {
+            setError('Download failed: ' + (dlErr.message || 'Unknown error'));
+            setDownloadingType(null);
+            return;
+          }
 
           // Trigger in-app toast
           setToast({
@@ -238,10 +273,9 @@ export default function App() {
           }
 
           setTimeout(() => {
-             setDownloadingType(null);
+            setDownloadingType(null);
+            setDownloadText('');
           }, 2000);
-          eventSource.close();
-          activeEventSourceRef.current = null;
         } else {
           setDownloadProgress(data.progress || 0);
           if (data.text) setDownloadText(data.text);
