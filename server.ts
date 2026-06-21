@@ -298,7 +298,7 @@ app.get("/api/prepare-stream", async (req, res) => {
       ];
     } else {
       args = [
-        '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best', 
+        '-f', 'bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[vcodec^=avc1]/b[ext=mp4]/best', 
         '--merge-output-format', 'mp4', 
         '--newline', 
         '--progress-template', '%(progress)j', 
