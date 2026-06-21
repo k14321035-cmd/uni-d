@@ -203,13 +203,15 @@ app.get("/api/prepare-stream", async (req, res) => {
   // Define fallback to loader.to
   const runLoaderToFallback = async () => {
     try {
-      res.write(`data: ${JSON.stringify({ progress: 10, text: "Yt-dlp failed, falling back to proxy downloader..." })}\n\n`);
+      res.write(`data: ${JSON.stringify({ progress: 10, text: "Yt-dlp failed, using proxy downloader..." })}\n\n`);
       const formatSelection = type === 'audio' ? "mp3" : "1080";
       const startRes = await fetch(`https://loader.to/ajax/download.php?format=${formatSelection}&url=${encodeURIComponent(url)}`);
       const startData = await startRes.json();
       
       const progUrl = startData.progress_url || ('https://lto2.affadaffa.com/api/progress?id=' + startData.id);
       
+      let proxyDownloadUrl: string | null = null;
+
       for (let i = 0; i < 60; i++) {
         await new Promise(resolve => setTimeout(resolve, 2000));
         const progRes = await fetch(progUrl);
@@ -218,16 +220,59 @@ app.get("/api/prepare-stream", async (req, res) => {
         let pct = progData.progress || 0;
         if (pct > 100 && pct <= 1000) pct = Math.floor(pct / 10);
         
-        res.write(`data: ${JSON.stringify({ progress: Math.min(99, Math.max(10, pct)), text: progData.text || "Downloading via proxy" })}\n\n`);
+        res.write(`data: ${JSON.stringify({ progress: Math.min(85, Math.max(10, pct)), text: progData.text || "Downloading via proxy..." })}\n\n`);
 
         if (progData.success === 1 && progData.download_url) {
-           res.write(`data: ${JSON.stringify({ downloadUrl: progData.download_url, progress: 100 })}\n\n`);
-           res.end();
-           return;
+          proxyDownloadUrl = progData.download_url;
+          break;
         }
       }
-      res.write(`data: ${JSON.stringify({ error: "Timeout generating download link." })}\n\n`);
+
+      if (!proxyDownloadUrl) {
+        res.write(`data: ${JSON.stringify({ error: "Timeout generating download link." })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // ── KEY FIX ──────────────────────────────────────────────────────────────
+      // Never forward the ad-redirect URL to the client.
+      // Instead, fetch the file on the server side and save it to the downloads
+      // folder, then serve it through our own clean /api/download-file endpoint.
+      res.write(`data: ${JSON.stringify({ progress: 90, text: "Saving file to server..." })}\n\n`);
+
+      const ext = type === 'audio' ? 'mp3' : 'mp4';
+      const destPath = path.join(downloadsDir, `${cacheKey}.${ext}`);
+
+      const fileRes = await fetch(proxyDownloadUrl);
+      if (!fileRes.ok || !fileRes.body) {
+        throw new Error(`Proxy file fetch failed: HTTP ${fileRes.status}`);
+      }
+
+      const fileStream = fs.createWriteStream(destPath);
+      await new Promise<void>((resolve, reject) => {
+        Readable.fromWeb(fileRes.body as any).pipe(fileStream);
+        fileStream.on("finish", () => { fileStream.close(); resolve(); });
+        fileStream.on("error", (err) => { fs.unlink(destPath, () => {}); reject(err); });
+      });
+
+      // Write metadata so /api/downloads can list it
+      const metadata = {
+        title: title || "Unknown Video",
+        type,
+        ext,
+        thumbnail: thumbnail || "",
+        downloadedAt: Date.now()
+      };
+      fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
+
+      res.write(`data: ${JSON.stringify({
+        progress: 100,
+        text: "Finished!",
+        downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}`
+      })}\n\n`);
       res.end();
+      // ─────────────────────────────────────────────────────────────────────────
+
     } catch (err: any) {
       res.write(`data: ${JSON.stringify({ error: "Download failed: " + err.message })}\n\n`);
       res.end();
