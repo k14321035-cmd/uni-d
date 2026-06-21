@@ -1,0 +1,6 @@
+{
+  "name": "Universal Video Downloader",
+  "description": "Download videos or audio from any URL using the power of yt-dlp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
