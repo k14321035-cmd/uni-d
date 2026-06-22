@@ -11,6 +11,15 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json());
 
+// ─── Version check config ──────────────────────────────────────────────────────
+const APP_VERSION_CONFIG = {
+  android: {
+    minVersion: 1,
+    latestVersion: 2,
+    updateUrl: "https://codetutorium.com/downloads/all-video-downloader.apk"
+  }
+};
+
 // Allow requests from Capacitor Android (http://localhost),
 // Capacitor iOS (capacitor://localhost), and browsers (any origin).
 app.use((req, res, next) => {
@@ -19,6 +28,26 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
+  }
+  next();
+});
+
+// Enforce client version restrictions to block outdated requests
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/api/") || req.path.startsWith("/api/version-check")) {
+    return next();
+  }
+  const platform = req.query.platform || req.body?.platform;
+  const versionStr = req.query.version || req.body?.version;
+  if (platform === "android") {
+    const clientVersion = parseInt(versionStr as string, 10) || 1;
+    const config = APP_VERSION_CONFIG.android;
+    if (clientVersion < config.minVersion) {
+      return res.status(426).json({
+        error: "App update required. This version is no longer supported and has stopped working.",
+        updateUrl: config.updateUrl,
+      });
+    }
   }
   next();
 });
@@ -600,13 +629,6 @@ app.post("/api/delete-download", (req, res) => {
 });
 
 // ─── Version check endpoint ───────────────────────────────────────────────────
-const APP_VERSION_CONFIG = {
-  android: {
-    minVersion: 2,
-    latestVersion: 2,
-    updateUrl: "https://codetutorium.com/downloads/all-video-downloader.apk"
-  }
-};
 
 app.get("/api/version-check", (req, res) => {
   const { platform, version } = req.query;

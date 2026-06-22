@@ -42,6 +42,8 @@ export default function App() {
       const platform = urlParams.get('platform');
       const version = urlParams.get('version');
       
+      let isUpdateBlocked = false;
+      
       if (platform === 'android') {
         try {
           const res = await fetch(apiUrl(`/api/version-check?platform=android&version=${version || 1}`));
@@ -50,6 +52,8 @@ export default function App() {
             if (data.updateRequired) {
               setUpdateRequired(true);
               setUpdateUrl(data.updateUrl);
+              setIsAppLoading(false);
+              isUpdateBlocked = true;
             }
           }
         } catch (err) {
@@ -57,9 +61,11 @@ export default function App() {
         }
       }
       
-      setTimeout(() => {
-        setIsAppLoading(false);
-      }, 4000);
+      if (!isUpdateBlocked) {
+        setTimeout(() => {
+          setIsAppLoading(false);
+        }, 4000);
+      }
     };
     checkVersion();
   }, []);
@@ -183,22 +189,36 @@ export default function App() {
   const handleDownload = async (type: 'video' | 'audio') => {
     if (!url) return;
 
+    // Immediately show status indicator and starting phase
+    setDownloadingType(type);
+    setError('');
+    setDownloadProgress(2);
+    setDownloadText('Wait there... Seeking permissions...');
+
     // Request notification permission if not yet granted
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-      Notification.requestPermission();
+      try {
+        await Notification.requestPermission();
+      } catch (err) {
+        console.warn("Notification request permission failed:", err);
+      }
     }
 
     // Check Android Storage Permission before starting
     const permissionGranted = await checkAndRequestAndroidPermissions();
     if (!permissionGranted) {
       setError("Storage permission is required to save downloads on this device.");
+      setDownloadingType(null);
       return;
     }
 
-    setDownloadingType(type);
-    setError('');
-    setDownloadProgress(0);
-    setDownloadText('Connecting...');
+    // Display permission granted feedback briefly
+    setDownloadProgress(10);
+    setDownloadText('Permission granted! 🎉');
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    setDownloadProgress(18);
+    setDownloadText('Gathering the video...');
 
     const titleParam = videoInfo ? `&title=${encodeURIComponent(videoInfo.title)}` : '';
     const thumbParam = videoInfo ? `&thumbnail=${encodeURIComponent(videoInfo.thumbnail)}` : '';
@@ -215,7 +235,7 @@ export default function App() {
           activeEventSourceRef.current = null;
         } else if (data.downloadUrl) {
           setDownloadProgress(100);
-          setDownloadText('Saving file...');
+          setDownloadText('Saving to your device...');
           eventSource.close();
           activeEventSourceRef.current = null;
 
@@ -223,30 +243,45 @@ export default function App() {
           const absoluteUrl = apiUrl(data.downloadUrl);
 
           try {
-            // Fetch file as blob — no page navigation, no redirect
-            const fileResp = await fetch(absoluteUrl);
-            if (!fileResp.ok) throw new Error(`Server error: ${fileResp.status}`);
-            const blob = await fileResp.blob();
+            // ── Derive the REAL extension from the server's downloadUrl ──────
+            const urlParams = new URLSearchParams(data.downloadUrl.split('?')[1] || '');
+            const realExt = urlParams.get('ext') || (type === 'audio' ? 'mp3' : 'mp4');
 
-            // Derive a clean filename
-            const ext = type === 'audio' ? 'mp3' : 'mp4';
             const safeName = (videoInfo?.title || 'video')
               .replace(/[^\w\s-]/g, '')
               .trim()
               .substring(0, 80) || 'video';
-            const filename = `${safeName}.${ext}`;
+            const filename = `${safeName}.${realExt}`;
 
-            // Create a temporary object URL and click a hidden <a download>
-            const blobUrl = URL.createObjectURL(blob);
-            const anchor = document.createElement('a');
-            anchor.href = blobUrl;
-            anchor.download = filename;
-            anchor.style.display = 'none';
-            document.body.appendChild(anchor);
-            anchor.click();
-            document.body.removeChild(anchor);
-            // Revoke after a short delay to let the browser start the download
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+            const isAndroid =
+              typeof (window as any).Capacitor !== 'undefined' &&
+              (window as any).Capacitor?.isNativePlatform?.() === true;
+
+            if (isAndroid) {
+              // ── Android path ─────────────────────────────────────────────
+              const androidBridge = (window as any).AndroidInterface;
+              if (androidBridge?.downloadFile) {
+                androidBridge.downloadFile(absoluteUrl, filename);
+              } else {
+                (window as any).open(absoluteUrl, '_system');
+              }
+            } else {
+              // ── Browser / Desktop path ───────────────────────────────────
+              setDownloadText('Saving to your device...');
+              const fileResp = await fetch(absoluteUrl);
+              if (!fileResp.ok) throw new Error(`Server error: ${fileResp.status}`);
+              const blob = await fileResp.blob();
+
+              const blobUrl = URL.createObjectURL(blob);
+              const anchor = document.createElement('a');
+              anchor.href = blobUrl;
+              anchor.download = filename;
+              anchor.style.display = 'none';
+              document.body.appendChild(anchor);
+              anchor.click();
+              document.body.removeChild(anchor);
+              setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+            }
           } catch (dlErr: any) {
             setError('Download failed: ' + (dlErr.message || 'Unknown error'));
             setDownloadingType(null);
@@ -277,8 +312,16 @@ export default function App() {
             setDownloadText('');
           }, 2000);
         } else {
-          setDownloadProgress(data.progress || 0);
-          if (data.text) setDownloadText(data.text);
+          // Map raw status indicators to simple friendly stages
+          const pct = data.progress || 0;
+          setDownloadProgress(pct);
+          if (pct >= 85) {
+            setDownloadText('Optimizing file quality...');
+          } else if (pct >= 20) {
+            setDownloadText(`Now downloading... ${pct}%`);
+          } else {
+            setDownloadText('Gathering the video...');
+          }
         }
       } catch (e) {
         console.error("Error parsing SSE:", e);
@@ -304,7 +347,7 @@ export default function App() {
 
   if (isAppLoading) {
     return (
-      <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-hidden flex flex-col items-center justify-center p-6 selection:bg-indigo-500/30">
+      <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-hidden flex flex-col items-center justify-center pt-[calc(env(safe-area-inset-top,20px)+24px)] pb-[calc(env(safe-area-inset-bottom,20px)+24px)] px-6 selection:bg-indigo-500/30">
         {/* Decorative Background Elements */}
         <div className="absolute top-[-100px] left-[20%] w-[500px] h-[500px] bg-indigo-600/20 rounded-full blur-[120px] pointer-events-none mix-blend-screen"></div>
         <div className="absolute bottom-[-100px] right-[20%] w-[500px] h-[500px] bg-purple-600/10 rounded-full blur-[150px] pointer-events-none mix-blend-screen"></div>
@@ -358,7 +401,7 @@ export default function App() {
 
   if (updateRequired) {
     return (
-      <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-hidden flex items-center justify-center p-6 selection:bg-rose-500/30">
+      <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-hidden flex items-center justify-center pt-[calc(env(safe-area-inset-top,20px)+24px)] pb-[calc(env(safe-area-inset-bottom,20px)+24px)] px-6 selection:bg-rose-500/30">
         {/* Decorative Background Elements */}
         <div className="absolute top-[-10%] left-[20%] w-[500px] h-[500px] bg-rose-600/20 rounded-full blur-[120px] pointer-events-none mix-blend-screen"></div>
         <div className="absolute bottom-[-10%] right-[20%] w-[500px] h-[500px] bg-indigo-600/10 rounded-full blur-[150px] pointer-events-none mix-blend-screen"></div>
@@ -399,7 +442,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-x-hidden flex flex-col selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-slate-950 text-white font-sans relative overflow-x-hidden overflow-y-auto flex flex-col selection:bg-indigo-500/30 pb-[calc(env(safe-area-inset-bottom,20px)+24px)]">
       {/* Decorative Background Elements */}
       <div className="absolute top-[-150px] left-[10%] w-[500px] h-[500px] bg-indigo-600/20 rounded-full blur-[120px] pointer-events-none mix-blend-screen"></div>
       <div className="absolute bottom-[-100px] right-[10%] w-[600px] h-[600px] bg-purple-600/10 rounded-full blur-[150px] pointer-events-none mix-blend-screen"></div>
@@ -408,23 +451,42 @@ export default function App() {
       <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none mix-blend-overlay"></div>
       <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none"></div>
 
-      <div className="relative z-10 flex-grow flex flex-col px-6 py-12 w-full overflow-y-auto max-w-5xl mx-auto">
+      {/* Fixed Top Header */}
+      <header className="fixed top-0 left-0 right-0 z-40 w-full bg-slate-950/80 backdrop-blur-xl border-b border-white/5 pt-[env(safe-area-inset-top,16px)] pb-4 px-6 transition-all duration-300">
+        <div className="max-w-5xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(99,102,241,0.3)]">
+              <Download className="w-5.5 h-5.5 text-white" />
+            </div>
+            <div>
+              <span className="font-display font-bold text-lg tracking-tight bg-gradient-to-r from-white to-slate-200 text-transparent bg-clip-text block leading-none">
+                All Video Downloader
+              </span>
+              <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-widest mt-0.5 block">
+                Universal Engine
+              </span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div className="relative z-10 flex-grow flex flex-col px-6 pt-[calc(env(safe-area-inset-top,16px)+76px)] sm:pt-[calc(env(safe-area-inset-top,16px)+92px)] pb-12 w-full max-w-5xl mx-auto">
         
         {/* Header */}
-        <div className="text-center mb-14 mt-8">
+        <div className="text-center mb-8 mt-2 md:mb-14 md:mt-8 flex flex-col items-center">
           <motion.div
             initial={{ opacity: 0, scale: 0.8, rotate: -10 }}
             animate={{ opacity: 1, scale: 1, rotate: 0 }}
             transition={{ type: "spring", stiffness: 200, damping: 20 }}
-            className="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-2xl mb-8 shadow-[0_0_40px_rgba(99,102,241,0.4)]"
+            className="flex items-center justify-center w-12 h-12 md:w-16 md:h-16 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-2xl mb-4 md:mb-8 shadow-[0_0_40px_rgba(99,102,241,0.4)]"
           >
-            <Download className="w-8 h-8 text-white" />
+            <Download className="w-6 h-6 md:w-8 md:h-8 text-white" />
           </motion.div>
           <motion.h1 
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.1, duration: 0.5 }}
-            className="text-5xl md:text-7xl font-display font-extrabold mb-6 tracking-tight bg-gradient-to-br from-white via-indigo-100 to-indigo-400 text-transparent bg-clip-text pb-2"
+            className="text-3xl sm:text-5xl md:text-7xl font-display font-extrabold mb-4 md:mb-6 tracking-tight bg-gradient-to-br from-white via-indigo-100 to-indigo-400 text-transparent bg-clip-text pb-1 md:pb-2 px-2"
           >
             All Video Downloader
           </motion.h1>
@@ -432,7 +494,7 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ delay: 0.2, duration: 0.5 }}
-            className="text-slate-400 text-lg md:text-xl max-w-2xl mx-auto leading-relaxed"
+            className="text-slate-400 text-sm sm:text-base md:text-xl max-w-2xl mx-auto leading-relaxed px-4 md:px-0"
           >
             Instantly download high-quality video and audio from your favorite platforms. Fast, secure, and completely free.
           </motion.p>
@@ -443,38 +505,34 @@ export default function App() {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.3, duration: 0.5 }}
-          className="mb-14 w-full max-w-3xl mx-auto"
+          className="mb-8 md:mb-14 w-full max-w-3xl mx-auto px-1 sm:px-0"
         >
-          <form onSubmit={fetchInfo} className="bg-slate-900/50 backdrop-blur-xl border border-white/10 p-3 sm:p-2 rounded-3xl sm:rounded-[2rem] shadow-2xl flex flex-col sm:flex-row items-stretch sm:items-center relative focus-within:ring-2 focus-within:ring-indigo-500/50 focus-within:border-indigo-500/50 transition-all duration-300 gap-2 sm:gap-0">
-            <div className="hidden sm:flex px-6-text-white/40 pl-6 pr-4">
-              <Search className="h-6 w-6 text-slate-400" />
+          <form onSubmit={fetchInfo} className="bg-slate-900/50 backdrop-blur-xl border border-white/10 p-1.5 sm:p-2 rounded-2xl sm:rounded-[2rem] shadow-2xl flex flex-row items-center relative focus-within:ring-2 focus-within:ring-indigo-500/50 focus-within:border-indigo-500/50 transition-all duration-300 gap-1.5 sm:gap-0">
+            <div className="flex px-2 sm:px-6 text-white/40 pl-3 sm:pl-6 pr-1 sm:pr-4 shrink-0">
+              <Search className="h-4 w-4 sm:h-6 sm:w-6 text-slate-400" />
             </div>
             <input
               type="url"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              placeholder="Paste video URL here (YouTube, Twitter, etc.)..."
+              placeholder="Paste video URL here..."
               required
-              className="flex-grow bg-transparent border-none outline-none text-base sm:text-lg md:text-xl placeholder:text-slate-500 text-white font-medium min-w-0 py-3 sm:py-4 px-4 sm:px-0"
+              className="flex-grow bg-transparent border-none outline-none text-sm sm:text-lg md:text-xl placeholder:text-slate-500 text-white font-medium min-w-0 py-2 sm:py-4 px-1 sm:px-0"
             />
             <button
               type="submit"
               disabled={loading || !url}
-              className="bg-indigo-500 hover:bg-indigo-400 disabled:bg-indigo-500/50 text-white px-6 sm:px-10 py-3.5 sm:py-4 rounded-2xl sm:rounded-full font-bold transition-all shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] flex items-center justify-center gap-2 shrink-0 sm:ml-2"
+              className="bg-indigo-500 hover:bg-indigo-400 disabled:bg-indigo-500/50 text-white px-4 sm:px-10 py-2.5 sm:py-4 rounded-xl sm:rounded-full font-bold transition-all active:scale-95 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] flex items-center justify-center gap-2 shrink-0 ml-1 sm:ml-2 text-xs sm:text-base"
             >
-              {loading ? <Loader2 className="w-6 h-6 animate-spin" /> : 'Fetch'}
+              {loading ? <Loader2 className="w-4 h-4 sm:w-6 sm:h-6 animate-spin" /> : 'Fetch'}
             </button>
           </form>
-            
-          <div className="mt-8 flex flex-wrap gap-4 text-sm justify-center items-center">
-            <span className="text-slate-500 font-semibold uppercase tracking-[0.15em] text-xs">Example:</span>
-            <button
-              type="button"
-              onClick={() => setUrl('https://www.youtube.com/watch?v=F3_mPteSgMw')}
-              className="px-5 py-2 bg-slate-800/50 hover:bg-slate-700/50 border border-white/5 hover:border-white/10 rounded-full text-indigo-300 font-medium transition-all backdrop-blur-md"
-            >
-              Top Flight
-            </button>
+          
+          <div className="mt-4 text-center">
+            <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-indigo-500/10 border border-indigo-500/20 rounded-full text-xs font-semibold text-indigo-300 backdrop-blur-md shadow-[0_0_15px_rgba(99,102,241,0.05)] select-none">
+              <Sparkles className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
+              Videos are always downloaded in high quality
+            </span>
           </div>
         </motion.div>
 
@@ -544,14 +602,14 @@ export default function App() {
                 <div className="w-full md:w-1/2 lg:w-5/12 bg-black/40 relative aspect-video flex-shrink-0 animate-pulse">
                 </div>
                 
-                <div className="p-8 md:p-10 flex flex-col justify-center w-full md:w-1/2 lg:w-7/12 gap-3">
-                  <div className="h-8 bg-white/10 rounded-lg animate-pulse w-3/4"></div>
-                  <div className="h-8 bg-white/10 rounded-lg animate-pulse w-1/2 mb-4"></div>
-                  <div className="h-4 bg-white/10 rounded-lg animate-pulse w-1/3 mb-8"></div>
+                <div className="p-5 md:p-10 flex flex-col justify-center w-full md:w-1/2 lg:w-7/12 gap-3">
+                  <div className="h-6 bg-white/10 rounded-lg animate-pulse w-3/4"></div>
+                  <div className="h-6 bg-white/10 rounded-lg animate-pulse w-1/2 mb-4"></div>
+                  <div className="h-4 bg-white/10 rounded-lg animate-pulse w-1/3 mb-4"></div>
                   
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="h-14 bg-indigo-500/20 rounded-2xl animate-pulse"></div>
-                    <div className="h-14 bg-white/5 rounded-2xl animate-pulse"></div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
+                    <div className="h-12 bg-indigo-500/20 rounded-2xl animate-pulse"></div>
+                    <div className="h-12 bg-white/5 rounded-2xl animate-pulse"></div>
                   </div>
                 </div>
               </div>
@@ -565,7 +623,7 @@ export default function App() {
               className="bg-slate-900/60 backdrop-blur-xl border border-white/10 rounded-[2rem] overflow-hidden shadow-2xl mb-10 max-w-4xl mx-auto w-full"
             >
               <div className="flex flex-col md:flex-row">
-                <div className="w-full md:w-1/2 lg:w-5/12 bg-black/60 relative p-4 flex items-center justify-center">
+                <div className="w-full md:w-1/2 lg:w-5/12 bg-black/60 relative p-3 md:p-4 flex items-center justify-center">
                   <div className="relative w-full h-full rounded-xl overflow-hidden aspect-video shadow-lg">
                     {videoInfo.thumbnail ? (
                       <img 
@@ -586,9 +644,9 @@ export default function App() {
                   </div>
                 </div>
                 
-                <div className="p-8 md:p-10 flex flex-col justify-center w-full md:w-1/2 lg:w-7/12">
-                  <div className="flex items-start justify-between gap-4 mb-3">
-                    <h3 className="text-2xl md:text-3xl font-display font-bold line-clamp-2 leading-tight text-white">
+                <div className="p-5 md:p-10 flex flex-col justify-center w-full md:w-1/2 lg:w-7/12">
+                  <div className="flex items-start justify-between gap-4 mb-2">
+                    <h3 className="text-xl md:text-3xl font-display font-bold line-clamp-2 leading-tight text-white">
                       {videoInfo.title}
                     </h3>
                     <button
@@ -599,18 +657,18 @@ export default function App() {
                         {copied ? <Check className="w-5 h-5 text-emerald-400" /> : <Copy className="w-5 h-5" />}
                     </button>
                   </div>
-                  <p className="text-slate-400 mb-8 border-b border-white/5 pb-6 line-clamp-1 font-medium">
+                  <p className="text-slate-400 text-xs sm:text-sm mb-4 md:mb-8 border-b border-white/5 pb-3 md:pb-6 line-clamp-1 font-medium">
                     {videoInfo.channel}
                   </p>
                   
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
                     {downloadingType ? (
-                      <div className="col-span-1 sm:col-span-2 bg-indigo-500/10 border border-indigo-500/30 rounded-2xl p-6">
+                      <div className="col-span-1 sm:col-span-2 bg-indigo-500/10 border border-indigo-500/30 rounded-2xl p-4 sm:p-6">
                         <div className="flex items-center justify-between mb-3">
-                          <span className="text-indigo-300 font-medium">{downloadText}</span>
-                          <span className="text-white font-bold">{downloadProgress}%</span>
+                          <span className="text-indigo-300 font-medium text-sm sm:text-base">{downloadText}</span>
+                          <span className="text-white font-bold text-sm sm:text-base">{downloadProgress}%</span>
                         </div>
-                        <div className="w-full bg-slate-900/50 rounded-full h-3 overflow-hidden">
+                        <div className="w-full bg-slate-900/50 rounded-full h-2.5 sm:h-3 overflow-hidden">
                           <motion.div 
                             className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full rounded-full"
                             initial={{ width: 0 }}
@@ -623,14 +681,14 @@ export default function App() {
                       <>
                         <button 
                           onClick={() => handleDownload('video')}
-                          className="flex items-center justify-center gap-3 w-full py-4 bg-indigo-500 hover:bg-indigo-400 text-white font-bold rounded-2xl transition-colors shadow-lg shadow-indigo-500/30"
+                          className="flex items-center justify-center gap-3 w-full py-3.5 sm:py-4 bg-indigo-500 hover:bg-indigo-400 active:scale-97 text-white font-bold rounded-2xl transition-all shadow-lg shadow-indigo-500/30 text-sm sm:text-base"
                         >
                           <Video className="w-5 h-5" />
                           Download Video
                         </button>
                         <button 
                           onClick={() => handleDownload('audio')}
-                          className="flex items-center justify-center gap-3 w-full py-4 bg-white/10 hover:bg-white/20 text-white font-bold rounded-2xl transition-colors backdrop-blur-lg border border-white/10"
+                          className="flex items-center justify-center gap-3 w-full py-3.5 sm:py-4 bg-white/10 hover:bg-white/20 active:scale-97 text-white font-bold rounded-2xl transition-all backdrop-blur-lg border border-white/10 text-sm sm:text-base"
                         >
                           <Music className="w-5 h-5" />
                           Download Audio
@@ -668,6 +726,9 @@ export default function App() {
           </p>
         </motion.footer>
 
+        {/* Bottom layout spacer for mobile screen breathing room */}
+        <div className="h-12 sm:h-16 w-full shrink-0" />
+
       </div>
 
       {/* Toast Notification */}
@@ -677,7 +738,7 @@ export default function App() {
             initial={{ opacity: 0, y: 50, scale: 0.9 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 20, scale: 0.9 }}
-            className="fixed bottom-6 right-6 z-50 max-w-md w-full sm:w-[28rem] bg-slate-900/80 backdrop-blur-2xl border border-white/10 p-5 rounded-2xl shadow-2xl flex items-start gap-4 select-none"
+            className="fixed bottom-[calc(env(safe-area-inset-bottom,24px)+16px)] left-4 right-4 sm:left-auto sm:right-6 z-50 max-w-md w-full sm:w-[28rem] bg-slate-900/80 backdrop-blur-2xl border border-white/10 p-5 rounded-2xl shadow-2xl flex items-start gap-4 select-none"
           >
             <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0 shadow-[0_0_15px_rgba(16,185,129,0.1)]">
               <Check className="w-5 h-5 animate-pulse" />

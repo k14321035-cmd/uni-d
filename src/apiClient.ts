@@ -41,7 +41,25 @@ const BASE_URL: string = (() => {
 export function apiUrl(path: string): string {
   // Ensure path starts with /
   const normalised = path.startsWith('/') ? path : `/${path}`;
-  return `${BASE_URL}${normalised}`;
+  
+  const urlParams = new URLSearchParams(window.location.search);
+  const platform = urlParams.get('platform');
+  const version = urlParams.get('version');
+
+  let fullUrl = `${BASE_URL}${normalised}`;
+  
+  if (platform || version) {
+    const parts = fullUrl.split('?');
+    const basePath = parts[0];
+    const queryParams = new URLSearchParams(parts[1] || '');
+    
+    if (platform) queryParams.set('platform', platform);
+    if (version) queryParams.set('version', version);
+    
+    fullUrl = `${basePath}?${queryParams.toString()}`;
+  }
+  
+  return fullUrl;
 }
 
 /**
