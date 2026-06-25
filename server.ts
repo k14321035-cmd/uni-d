@@ -271,84 +271,124 @@ app.get("/api/prepare-stream", async (req, res) => {
     }
   }
 
-  // ─── Loader.to fallback — always returns MP4, great for YouTube ───────────
-  const runLoaderToFallback = async () => {
+  // ─── Helper: download a direct URL and save it to the cache ─────────────────
+  const saveDirectUrl = async (directUrl: string, ext: string): Promise<void> => {
+    const destPath = path.join(downloadsDir, `${cacheKey}.${ext}`);
+    const tmpPath = `${destPath}.tmp`;
+
+    const fileRes = await fetch(directUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    if (!fileRes.ok || !fileRes.body) throw new Error(`HTTP ${fileRes.status}`);
+    const ct = fileRes.headers.get('content-type') || '';
+    if (ct.includes('text/html')) throw new Error('Server returned HTML instead of video');
+
+    const fileStream = fs.createWriteStream(tmpPath);
+    await new Promise<void>((resolve, reject) => {
+      Readable.fromWeb(fileRes.body as any).pipe(fileStream);
+      fileStream.on('finish', () => { fileStream.close(); resolve(); });
+      fileStream.on('error', (e) => { fs.unlink(tmpPath, () => {}); reject(e); });
+    });
+
+    const savedSize = fs.statSync(tmpPath).size;
+    if (savedSize < 4096) { fs.unlinkSync(tmpPath); throw new Error('File too small — likely an error page'); }
+
+    fs.renameSync(tmpPath, destPath);
+    const metadata = { title: title || 'Unknown Video', type, ext, thumbnail: thumbnail || '', downloadedAt: Date.now() };
+    fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
+  };
+
+  // ─── Fallback chain — tried in order when yt-dlp fails ───────────────────
+  // Service 1: cobalt.tools — fast, reliable, no polling loop needed
+  // Service 2: loader.to — slower, needs progress polling
+  // Both always return MP4/MP3, never WebM.
+  const runFallbackChain = async () => {
+    const ext = type === 'audio' ? 'mp3' : 'mp4';
+    const downloadUrl = `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || 'video')}`;
+
+    // ── Service 1: cobalt.tools ───────────────────────────────────────────────
     try {
-      emit({ progress: 10, text: "Using backup downloader..." });
-      const formatSelection = type === 'audio' ? "mp3" : "mp4";
-      const startRes = await fetch(`https://loader.to/ajax/download.php?format=${formatSelection}&url=${encodeURIComponent(url)}`);
+      emit({ progress: 15, text: 'Trying cobalt downloader...' });
+      const cobaltRes = await fetch('https://api.cobalt.tools/', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          videoQuality: type === 'audio' ? undefined : '1080',
+          downloadMode: type === 'audio' ? 'audio' : 'auto',
+          audioFormat: type === 'audio' ? 'mp3' : undefined,
+          filenameStyle: 'basic'
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (cobaltRes.ok) {
+        const cobaltData = await cobaltRes.json();
+        console.log('[cobalt]', cobaltData.status, cobaltData.url?.substring(0, 80));
+
+        if ((cobaltData.status === 'stream' || cobaltData.status === 'tunnel' || cobaltData.status === 'redirect') && cobaltData.url) {
+          emit({ progress: 60, text: 'Cobalt found the video! Saving...' });
+          await saveDirectUrl(cobaltData.url, ext);
+          emit({ progress: 100, text: 'Download complete!', downloadUrl });
+          done();
+          return;
+        }
+
+        if (cobaltData.status === 'picker' && cobaltData.picker?.[0]?.url) {
+          emit({ progress: 60, text: 'Cobalt found the video! Saving...' });
+          await saveDirectUrl(cobaltData.picker[0].url, ext);
+          emit({ progress: 100, text: 'Download complete!', downloadUrl });
+          done();
+          return;
+        }
+      }
+      console.warn('[cobalt] No usable URL — trying loader.to');
+    } catch (cobaltErr: any) {
+      console.warn('[cobalt] Failed:', cobaltErr.message, '— trying loader.to');
+    }
+
+    // ── Service 2: loader.to ──────────────────────────────────────────────────
+    try {
+      emit({ progress: 20, text: 'Trying loader.to downloader...' });
+      const formatSelection = type === 'audio' ? 'mp3' : 'mp4';
+      const startRes = await fetch(
+        `https://loader.to/ajax/download.php?format=${formatSelection}&url=${encodeURIComponent(url)}`,
+        { signal: AbortSignal.timeout(10000) }
+      );
       const startData = await startRes.json();
-
       const progUrl = startData.progress_url || ('https://lto2.affadaffa.com/api/progress?id=' + startData.id);
-      let proxyDownloadUrl: string | null = null;
+      let proxyUrl: string | null = null;
 
-      for (let i = 0; i < 60; i++) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const progRes = await fetch(progUrl);
+      for (let i = 0; i < 30; i++) {  // 30 × 3s = 90s max
+        await new Promise(r => setTimeout(r, 3000));
+        const progRes = await fetch(progUrl, { signal: AbortSignal.timeout(8000) });
         const progData = await progRes.json();
 
         let pct = progData.progress || 0;
         if (pct > 100 && pct <= 1000) pct = Math.floor(pct / 10);
-        emit({ progress: Math.min(85, Math.max(10, pct)), text: progData.text || "Downloading via proxy..." });
+        emit({ progress: Math.min(80, Math.max(20, pct)), text: progData.text || 'Processing via loader.to...' });
 
         if (progData.success === 1 && progData.download_url) {
-          proxyDownloadUrl = progData.download_url;
+          proxyUrl = progData.download_url;
           break;
         }
       }
 
-      if (!proxyDownloadUrl) {
-        emit({ error: "Timeout generating download link. Please try again." });
+      if (proxyUrl) {
+        emit({ progress: 88, text: 'Saving from loader.to...' });
+        await saveDirectUrl(proxyUrl, ext);
+        emit({ progress: 100, text: 'Download complete!', downloadUrl });
         done();
         return;
       }
-
-      emit({ progress: 90, text: "Saving file to server..." });
-
-      const ext = type === 'audio' ? 'mp3' : 'mp4';
-      const destPath = path.join(downloadsDir, `${cacheKey}.${ext}`);
-      const tmpPath = `${destPath}.tmp`;
-
-      const fileRes = await fetch(proxyDownloadUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-      });
-      if (!fileRes.ok || !fileRes.body) {
-        throw new Error(`Backup downloader returned HTTP ${fileRes.status}`);
-      }
-
-      // Reject HTML error pages pretending to be video files
-      const contentType = fileRes.headers.get('content-type') || '';
-      if (contentType.includes('text/html')) {
-        throw new Error("Backup downloader returned an HTML error page instead of a video.");
-      }
-
-      const fileStream = fs.createWriteStream(tmpPath);
-      await new Promise<void>((resolve, reject) => {
-        Readable.fromWeb(fileRes.body as any).pipe(fileStream);
-        fileStream.on("finish", () => { fileStream.close(); resolve(); });
-        fileStream.on("error", (err) => { fs.unlink(tmpPath, () => {}); reject(err); });
-      });
-
-      // Verify size before exposing
-      const savedSize = fs.statSync(tmpPath).size;
-      if (savedSize < 4096) {
-        fs.unlinkSync(tmpPath);
-        throw new Error("Saved file is too small — likely an error page.");
-      }
-
-      fs.renameSync(tmpPath, destPath);
-
-      const metadata = { title: title || "Unknown Video", type, ext, thumbnail: thumbnail || "", downloadedAt: Date.now() };
-      fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
-
-      emit({ progress: 100, text: "Download complete!", downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}` });
-      done();
-
-    } catch (err: any) {
-      console.error("[loader.to fallback]", err.message);
-      emit({ error: "All download methods failed: " + err.message });
-      done();
+      console.warn('[loader.to] Timed out — giving up');
+    } catch (loaderErr: any) {
+      console.warn('[loader.to] Failed:', loaderErr.message);
     }
+
+    // All services failed
+    emit({ error: 'All download services failed for this URL. Try a different video or platform.' });
+    done();
   };
 
   // ─── Primary: yt-dlp ──────────────────────────────────────────────────────
@@ -356,6 +396,14 @@ app.get("/api/prepare-stream", async (req, res) => {
     await downloadYtDlp();
 
     let args: string[] = [];
+
+    // ── YouTube bot-detection bypass: use the iOS app client ─────────────────
+    // The iOS YouTube client is less aggressively rate-limited than the web client.
+    // This is the most effective bypass currently available without cookies.
+    const ytBypassArgs = isYoutube
+      ? ['--extractor-args', 'youtube:player_client=ios,mweb', '--user-agent',
+         'com.google.ios.youtube/19.16.3 CFNetwork/1474 Darwin/23.0.0']
+      : [];
 
     if (type === 'audio') {
       // Audio: extract to MP3 — universally playable on all devices
@@ -367,13 +415,13 @@ app.get("/api/prepare-stream", async (req, res) => {
         '--no-warnings',
         '--newline',
         '--progress-template', '%(progress)j',
+        ...ytBypassArgs,
         url,
         '-o', path.join(downloadsDir, `${cacheKey}.mp3`)
       ];
 
     } else if (hasFfmpeg) {
       // ffmpeg available: merge H.264 + AAC → fast-start MP4
-      // --no-prefer-free-formats = do NOT prefer VP9/WebM over H.264/MP4
       args = [
         '-f', 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]',
         '--merge-output-format', 'mp4',
@@ -383,15 +431,13 @@ app.get("/api/prepare-stream", async (req, res) => {
         '--newline',
         '--progress-template', '%(progress)j',
         '--postprocessor-args', 'ffmpeg:-movflags +faststart -c:v copy -c:a aac',
+        ...ytBypassArgs,
         url,
         '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
       ];
 
     } else {
-      // No ffmpeg: ONLY download pre-merged single-stream MP4 files.
-      // --no-prefer-free-formats is CRITICAL — prevents yt-dlp picking WebM.
-      // No "+" operator used — yt-dlp will error without ffmpeg if merge is needed.
-      // Non-zero exit → loader.to takes over.
+      // No ffmpeg: only pre-merged MP4 streams
       args = [
         '-f', 'best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/worst[ext=mp4]',
         '--no-prefer-free-formats',
@@ -399,6 +445,7 @@ app.get("/api/prepare-stream", async (req, res) => {
         '--no-warnings',
         '--newline',
         '--progress-template', '%(progress)j',
+        ...ytBypassArgs,
         url,
         '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
       ];
@@ -438,7 +485,7 @@ app.get("/api/prepare-stream", async (req, res) => {
       ytdlpFailed = true;
       processFinished = true;
       console.error("yt-dlp spawn error:", err);
-      if (isYoutube && !res.writableEnded) { runLoaderToFallback(); }
+      if (isYoutube && !res.writableEnded) { runFallbackChain(); }
       else { emit({ error: `yt-dlp error: ${err.message}` }); done(); }
     });
 
@@ -451,7 +498,7 @@ app.get("/api/prepare-stream", async (req, res) => {
 
         if (!finalFile) {
           console.warn("[yt-dlp] exit 0 but no output file found");
-          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          if (isYoutube && !res.writableEnded) { runFallbackChain(); return; }
           emit({ error: "Download finished but no file was saved." });
           done();
           return;
@@ -465,7 +512,7 @@ app.get("/api/prepare-stream", async (req, res) => {
         if (type === 'video' && (ext === 'webm' || ext === 'mkv')) {
           console.warn(`[yt-dlp] Unwanted format: ${ext} — falling back to loader.to`);
           try { fs.unlinkSync(filePath); } catch {}
-          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          if (isYoutube && !res.writableEnded) { runFallbackChain(); return; }
           emit({ error: "Downloaded format (WebM) is not playable on mobile. Please try again." });
           done();
           return;
@@ -479,7 +526,7 @@ app.get("/api/prepare-stream", async (req, res) => {
             throw new Error("File too small — likely a download error.");
           }
         } catch (statErr: any) {
-          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          if (isYoutube && !res.writableEnded) { runFallbackChain(); return; }
           emit({ error: statErr.message });
           done();
           return;
@@ -493,7 +540,7 @@ app.get("/api/prepare-stream", async (req, res) => {
 
       } else {
         console.warn(`[yt-dlp] Non-zero exit: ${code}`);
-        if (isYoutube && !res.writableEnded) { runLoaderToFallback(); }
+        if (isYoutube && !res.writableEnded) { runFallbackChain(); }
         else { emit({ error: `Download failed (yt-dlp exit ${code})` }); done(); }
       }
     });
@@ -507,7 +554,7 @@ app.get("/api/prepare-stream", async (req, res) => {
 
   } catch (err: any) {
     console.error("prepare-stream error:", err);
-    if (isYoutube && !res.writableEnded) { await runLoaderToFallback(); }
+    if (isYoutube && !res.writableEnded) { await runFallbackChain(); }
     else { emit({ error: err.message || "Failed to start download" }); done(); }
   }
 });
@@ -686,3 +733,4 @@ async function startServer() {
 }
 
 startServer();
+
