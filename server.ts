@@ -2,7 +2,7 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import fs from "fs";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import crypto from "crypto";
 import { Readable } from "stream";
 
@@ -60,6 +60,21 @@ const downloadsDir = path.join(process.cwd(), "downloads");
 if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir, { recursive: true });
 }
+
+// ─── ffmpeg availability check ────────────────────────────────────────────────
+// Without ffmpeg, yt-dlp cannot merge separate video+audio streams.
+// We detect this at startup so we can choose the right format selector.
+const hasFfmpeg: boolean = (() => {
+  try {
+    const result = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+    if (result.status === 0) {
+      console.log('[server] ffmpeg detected — merge formats enabled.');
+      return true;
+    }
+  } catch { /* not found */ }
+  console.warn('[server] ffmpeg NOT found — using pre-merged stream formats only. Videos will still be MP4 but limited to 720p.');
+  return false;
+})();
 
 // ─── Valid media extensions — NEVER return metadata JSON or partials ──────────
 const MEDIA_EXTS = new Set(['mp4', 'webm', 'mkv', 'mp3', 'm4a', 'ogg', 'opus', 'mov', 'avi']);
@@ -340,25 +355,38 @@ app.get("/api/prepare-stream", async (req, res) => {
         '-o', path.join(downloadsDir, `${cacheKey}.mp3`)
       ];
     } else {
-      // H.264 + AAC = universally playable on Android/iOS native players
-      // Format priority:
-      //   1. Best H.264 video + M4A audio (ideal: hardware decoded on all phones)
-      //   2. Any MP4 video + M4A audio (fallback)
-      //   3. Best H.264 video alone (no separate audio)
-      //   4. Best MP4 container
-      //   5. Absolute best available
-      args = [
-        '-f', 'bv[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv[ext=mp4]+ba[ext=m4a]/bv[vcodec^=avc1]+ba/b[ext=mp4]/best[ext=mp4]/best',
-        '--merge-output-format', 'mp4',
-        '--newline',
-        '--progress-template', '%(progress)j',
-        '--no-warnings',
-        // Add ffmpeg post-processing to remux into a clean, seekable MP4
-        // (moov atom at start = fast mobile seeking, no 0:00 duration bug)
-        '--postprocessor-args', 'ffmpeg:-movflags +faststart',
-        url,
-        '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
-      ];
+      if (hasFfmpeg) {
+        // ffmpeg available: merge best H.264 video + M4A audio into a clean, seekable MP4.
+        // moov atom at front (-movflags +faststart) = instant playback on Android without
+        // needing to fully buffer the file.
+        args = [
+          '-f', 'bv[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv[ext=mp4]+ba[ext=m4a]/bv[vcodec^=avc1]+ba/b[ext=mp4]/best[ext=mp4]/best',
+          '--merge-output-format', 'mp4',
+          '--newline',
+          '--progress-template', '%(progress)j',
+          '--no-warnings',
+          // Place moov atom at the start so Android can play before fully downloaded
+          '--postprocessor-args', 'ffmpeg:-movflags +faststart',
+          url,
+          '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
+        ];
+      } else {
+        // No ffmpeg: only request pre-merged streams (no "+" merge operator).
+        // Priority:
+        //   1. Pre-merged H.264 MP4 (best quality, universally playable)
+        //   2. Any pre-merged MP4
+        //   3. Best pre-merged H.264 in any container
+        //   4. Best pre-merged available
+        // We force ext=mp4 in the output template — yt-dlp won't try to remux.
+        args = [
+          '-f', 'b[vcodec^=avc1][ext=mp4]/b[ext=mp4]/b[vcodec^=avc1]/best[ext=mp4]/best',
+          '--newline',
+          '--progress-template', '%(progress)j',
+          '--no-warnings',
+          url,
+          '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
+        ];
+      }
     }
 
     // ─── FIX 4: Track yt-dlp process independently from request lifecycle ────
