@@ -210,7 +210,7 @@ app.post("/api/video-info", async (req, res) => {
       const info = JSON.parse(output);
       title = info.title;
       thumbnail = info.thumbnail;
-      uploader = info.uploader || info.extractor;
+uploader = info.uploader || info.extractor;
     }
 
     res.json({
@@ -240,35 +240,42 @@ app.get("/api/prepare-stream", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  // Flush headers immediately so client knows connection is alive
   res.flushHeaders();
 
   const cacheKey = crypto.createHash("md5").update(`${url}_${type}`).digest("hex");
+  const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
 
-  // Serve from cache if available
+  // ─── Helper to emit SSE ───────────────────────────────────────────────────
+  const emit = (data: object) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`); };
+  const done = () => { if (!res.writableEnded) res.end(); };
+
+  // ─── Serve from cache ─────────────────────────────────────────────────────
   const cachedFile = checkCachedFile(cacheKey);
   if (cachedFile) {
     const ext = path.extname(cachedFile).substring(1).toLowerCase();
-    // Ensure JSON metadata exists
-    const jsonPath = path.join(downloadsDir, `${cacheKey}.json`);
-    if (!fs.existsSync(jsonPath)) {
-      const metadata = { title: title || "Unknown Video", type, ext, thumbnail: thumbnail || "", downloadedAt: Date.now() };
-      fs.writeFileSync(jsonPath, JSON.stringify(metadata, null, 2));
+    // Never serve cached WebM — Android won't play it. Delete and re-download.
+    if (type === 'video' && (ext === 'webm' || ext === 'mkv')) {
+      console.warn(`[cache] Deleting non-MP4 cached file: ${cachedFile}`);
+      try { fs.unlinkSync(path.join(downloadsDir, cachedFile)); } catch {}
+      try { fs.unlinkSync(path.join(downloadsDir, `${cacheKey}.json`)); } catch {}
+      // fall through to re-download
+    } else {
+      const jsonPath = path.join(downloadsDir, `${cacheKey}.json`);
+      if (!fs.existsSync(jsonPath)) {
+        const metadata = { title: title || "Unknown Video", type, ext, thumbnail: thumbnail || "", downloadedAt: Date.now() };
+        fs.writeFileSync(jsonPath, JSON.stringify(metadata, null, 2));
+      }
+      emit({ progress: 100, text: "Serving from cache", downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}` });
+      done();
+      return;
     }
-    res.write(`data: ${JSON.stringify({
-      progress: 100,
-      text: "Serving from cache",
-      downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}`
-    })}\n\n`);
-    res.end();
-    return;
   }
 
-  // ─── Loader.to fallback (server-side fetch, no redirect to client) ──────────
+  // ─── Loader.to fallback — always returns MP4, great for YouTube ───────────
   const runLoaderToFallback = async () => {
     try {
-      res.write(`data: ${JSON.stringify({ progress: 10, text: "Using proxy downloader..." })}\n\n`);
-      const formatSelection = type === 'audio' ? "mp3" : "1080";
+      emit({ progress: 10, text: "Using backup downloader..." });
+      const formatSelection = type === 'audio' ? "mp3" : "mp4";
       const startRes = await fetch(`https://loader.to/ajax/download.php?format=${formatSelection}&url=${encodeURIComponent(url)}`);
       const startData = await startRes.json();
 
@@ -282,7 +289,7 @@ app.get("/api/prepare-stream", async (req, res) => {
 
         let pct = progData.progress || 0;
         if (pct > 100 && pct <= 1000) pct = Math.floor(pct / 10);
-        res.write(`data: ${JSON.stringify({ progress: Math.min(85, Math.max(10, pct)), text: progData.text || "Downloading via proxy..." })}\n\n`);
+        emit({ progress: Math.min(85, Math.max(10, pct)), text: progData.text || "Downloading via proxy..." });
 
         if (progData.success === 1 && progData.download_url) {
           proxyDownloadUrl = progData.download_url;
@@ -291,23 +298,28 @@ app.get("/api/prepare-stream", async (req, res) => {
       }
 
       if (!proxyDownloadUrl) {
-        res.write(`data: ${JSON.stringify({ error: "Timeout generating download link." })}\n\n`);
-        res.end();
+        emit({ error: "Timeout generating download link. Please try again." });
+        done();
         return;
       }
 
-      res.write(`data: ${JSON.stringify({ progress: 90, text: "Saving file to server..." })}\n\n`);
+      emit({ progress: 90, text: "Saving file to server..." });
 
       const ext = type === 'audio' ? 'mp3' : 'mp4';
       const destPath = path.join(downloadsDir, `${cacheKey}.${ext}`);
       const tmpPath = `${destPath}.tmp`;
 
-      // ─── FIX 3: Write to .tmp first, rename on success ───────────────────
       const fileRes = await fetch(proxyDownloadUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
       });
       if (!fileRes.ok || !fileRes.body) {
-        throw new Error(`Proxy file fetch failed: HTTP ${fileRes.status}`);
+        throw new Error(`Backup downloader returned HTTP ${fileRes.status}`);
+      }
+
+      // Reject HTML error pages pretending to be video files
+      const contentType = fileRes.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        throw new Error("Backup downloader returned an HTML error page instead of a video.");
       }
 
       const fileStream = fs.createWriteStream(tmpPath);
@@ -317,92 +329,91 @@ app.get("/api/prepare-stream", async (req, res) => {
         fileStream.on("error", (err) => { fs.unlink(tmpPath, () => {}); reject(err); });
       });
 
-      // Atomic rename: only expose file when it's 100% written
+      // Verify size before exposing
+      const savedSize = fs.statSync(tmpPath).size;
+      if (savedSize < 4096) {
+        fs.unlinkSync(tmpPath);
+        throw new Error("Saved file is too small — likely an error page.");
+      }
+
       fs.renameSync(tmpPath, destPath);
 
       const metadata = { title: title || "Unknown Video", type, ext, thumbnail: thumbnail || "", downloadedAt: Date.now() };
       fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
 
-      res.write(`data: ${JSON.stringify({
-        progress: 100,
-        text: "Finished!",
-        downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}`
-      })}\n\n`);
-      res.end();
+      emit({ progress: 100, text: "Download complete!", downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}` });
+      done();
 
     } catch (err: any) {
-      res.write(`data: ${JSON.stringify({ error: "Download failed: " + err.message })}\n\n`);
-      res.end();
+      console.error("[loader.to fallback]", err.message);
+      emit({ error: "All download methods failed: " + err.message });
+      done();
     }
   };
 
-  // ─── Primary: yt-dlp download ─────────────────────────────────────────────
+  // ─── Primary: yt-dlp ──────────────────────────────────────────────────────
   try {
     await downloadYtDlp();
 
     let args: string[] = [];
+
     if (type === 'audio') {
-      // ─── FIX 3: Use explicit output name so no intermediate extension confusion
+      // Audio: extract to MP3 — universally playable on all devices
       args = [
-        '-f', 'ba[ext=m4a]/ba/bestaudio',
+        '-f', 'bestaudio[ext=m4a]/bestaudio',
         '-x', '--audio-format', 'mp3',
         '--audio-quality', '0',
+        '--no-playlist',
+        '--no-warnings',
         '--newline',
         '--progress-template', '%(progress)j',
-        '--no-warnings',
         url,
-        // Use explicit .mp3 output — no %(ext)s ambiguity
         '-o', path.join(downloadsDir, `${cacheKey}.mp3`)
       ];
+
+    } else if (hasFfmpeg) {
+      // ffmpeg available: merge H.264 + AAC → fast-start MP4
+      // --no-prefer-free-formats = do NOT prefer VP9/WebM over H.264/MP4
+      args = [
+        '-f', 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]',
+        '--merge-output-format', 'mp4',
+        '--no-prefer-free-formats',
+        '--no-playlist',
+        '--no-warnings',
+        '--newline',
+        '--progress-template', '%(progress)j',
+        '--postprocessor-args', 'ffmpeg:-movflags +faststart -c:v copy -c:a aac',
+        url,
+        '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
+      ];
+
     } else {
-      if (hasFfmpeg) {
-        // ffmpeg available: merge best H.264 video + M4A audio into a clean, seekable MP4.
-        // moov atom at front (-movflags +faststart) = instant playback on Android without
-        // needing to fully buffer the file.
-        args = [
-          '-f', 'bv[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv[ext=mp4]+ba[ext=m4a]/bv[vcodec^=avc1]+ba/b[ext=mp4]/best[ext=mp4]/best',
-          '--merge-output-format', 'mp4',
-          '--newline',
-          '--progress-template', '%(progress)j',
-          '--no-warnings',
-          // Place moov atom at the start so Android can play before fully downloaded
-          '--postprocessor-args', 'ffmpeg:-movflags +faststart',
-          url,
-          '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
-        ];
-      } else {
-        // No ffmpeg: only request pre-merged streams (no "+" merge operator).
-        // Priority:
-        //   1. Pre-merged H.264 MP4 (best quality, universally playable)
-        //   2. Any pre-merged MP4
-        //   3. Best pre-merged H.264 in any container
-        //   4. Best pre-merged available
-        // We force ext=mp4 in the output template — yt-dlp won't try to remux.
-        args = [
-          '-f', 'b[vcodec^=avc1][ext=mp4]/b[ext=mp4]/b[vcodec^=avc1]/best[ext=mp4]/best',
-          '--newline',
-          '--progress-template', '%(progress)j',
-          '--no-warnings',
-          url,
-          '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
-        ];
-      }
+      // No ffmpeg: ONLY download pre-merged single-stream MP4 files.
+      // --no-prefer-free-formats is CRITICAL — prevents yt-dlp picking WebM.
+      // No "+" operator used — yt-dlp will error without ffmpeg if merge is needed.
+      // Non-zero exit → loader.to takes over.
+      args = [
+        '-f', 'best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/worst[ext=mp4]',
+        '--no-prefer-free-formats',
+        '--no-playlist',
+        '--no-warnings',
+        '--newline',
+        '--progress-template', '%(progress)j',
+        url,
+        '-o', path.join(downloadsDir, `${cacheKey}.%(ext)s`)
+      ];
     }
 
-    // ─── FIX 4: Track yt-dlp process independently from request lifecycle ────
-    // Do NOT kill yt-dlp just because the SSE connection briefly drops.
-    // Only kill on explicit user cancel (detected by checking if res is still writable).
     const ytdlp = spawn(YTDLP_PATH, args);
     let buffer = "";
     let processFinished = false;
 
-    res.write(`data: ${JSON.stringify({ progress: 1, text: "Starting download..." })}\n\n`);
+    emit({ progress: 1, text: "Starting download..." });
 
     ytdlp.stdout.on("data", (data) => {
       buffer += data.toString();
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-
       for (const line of lines) {
         if (!line.trim().startsWith("{")) continue;
         try {
@@ -411,122 +422,96 @@ app.get("/api/prepare-stream", async (req, res) => {
             const pct = Math.floor(progress._percent || 0);
             const speed = progress._speed_str ? progress._speed_str.trim() : "";
             const eta = progress._eta_str ? progress._eta_str.trim() : "";
-            const text = `Downloading ${pct}%${speed ? ` at ${speed}` : ''}${eta ? `, ETA ${eta}` : ''}`;
-            // Only write if response is still open
-            if (!res.writableEnded) {
-              res.write(`data: ${JSON.stringify({ progress: pct, text })}\n\n`);
-            }
+            const text = `Downloading ${pct}%${speed ? ` at ${speed}` : ""}${eta ? `, ETA ${eta}` : ""}`;
+            emit({ progress: pct, text });
           }
-        } catch (e) {
-          // Ignore JSON parse errors from partial lines
-        }
+        } catch {}
       }
     });
 
-    // Log stderr for debugging but don't treat as failure (yt-dlp writes progress there too)
     ytdlp.stderr.on("data", (data) => {
       console.error("[yt-dlp stderr]", data.toString().trim());
     });
 
-    let hasFailed = false;
+    let ytdlpFailed = false;
     ytdlp.on("error", (err) => {
-      hasFailed = true;
+      ytdlpFailed = true;
       processFinished = true;
-      console.error("yt-dlp execution error:", err);
-      const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
-      if (isYoutube && !res.writableEnded) {
-        runLoaderToFallback();
-      } else if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: `yt-dlp failed: ${err.message}` })}\n\n`);
-        res.end();
-      }
+      console.error("yt-dlp spawn error:", err);
+      if (isYoutube && !res.writableEnded) { runLoaderToFallback(); }
+      else { emit({ error: `yt-dlp error: ${err.message}` }); done(); }
     });
 
     ytdlp.on("close", (code) => {
-      if (hasFailed) return;
+      if (ytdlpFailed) return;
       processFinished = true;
 
       if (code === 0) {
-        // ─── FIX 1 applied here: checkCachedFile only returns real media files
         const finalFile = checkCachedFile(cacheKey);
-        if (finalFile) {
-          const ext = path.extname(finalFile).substring(1).toLowerCase();
 
-          // ─── Extra safety: verify the file is non-zero bytes ────────────
-          try {
-            const stat = fs.statSync(path.join(downloadsDir, finalFile));
-            if (stat.size < 1024) {
-              // File is suspiciously tiny — delete and report error
-              fs.unlinkSync(path.join(downloadsDir, finalFile));
-              throw new Error("Downloaded file is too small — likely corrupt.");
-            }
-          } catch (statErr: any) {
-            if (!res.writableEnded) {
-              const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
-              if (isYoutube) {
-                runLoaderToFallback();
-              } else {
-                res.write(`data: ${JSON.stringify({ error: statErr.message })}\n\n`);
-                res.end();
-              }
-            }
-            return;
-          }
-
-          const metadata = {
-            title: title || "Unknown Video",
-            type,
-            ext,
-            thumbnail: thumbnail || "",
-            downloadedAt: Date.now()
-          };
-          fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
-
-          if (!res.writableEnded) {
-            res.write(`data: ${JSON.stringify({
-              progress: 100,
-              text: "Finished preparing!",
-              downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}`
-            })}\n\n`);
-            res.end();
-          }
-        } else {
-          if (!res.writableEnded) {
-            res.write(`data: ${JSON.stringify({ error: "Download succeeded but file was not found on server." })}\n\n`);
-            res.end();
-          }
+        if (!finalFile) {
+          console.warn("[yt-dlp] exit 0 but no output file found");
+          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          emit({ error: "Download finished but no file was saved." });
+          done();
+          return;
         }
+
+        const ext = path.extname(finalFile).substring(1).toLowerCase();
+        const filePath = path.join(downloadsDir, finalFile);
+
+        // ── CRITICAL MOBILE GUARD: WebM/MKV won't play on Android ─────────────
+        // yt-dlp may succeed but output WebM. Detect, delete, fall back to loader.to.
+        if (type === 'video' && (ext === 'webm' || ext === 'mkv')) {
+          console.warn(`[yt-dlp] Unwanted format: ${ext} — falling back to loader.to`);
+          try { fs.unlinkSync(filePath); } catch {}
+          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          emit({ error: "Downloaded format (WebM) is not playable on mobile. Please try again." });
+          done();
+          return;
+        }
+
+        // ── Reject suspiciously small files ─────────────────────────────────
+        try {
+          const stat = fs.statSync(filePath);
+          if (stat.size < 4096) {
+            fs.unlinkSync(filePath);
+            throw new Error("File too small — likely a download error.");
+          }
+        } catch (statErr: any) {
+          if (isYoutube && !res.writableEnded) { runLoaderToFallback(); return; }
+          emit({ error: statErr.message });
+          done();
+          return;
+        }
+
+        const metadata = { title: title || "Unknown Video", type, ext, thumbnail: thumbnail || "", downloadedAt: Date.now() };
+        fs.writeFileSync(path.join(downloadsDir, `${cacheKey}.json`), JSON.stringify(metadata, null, 2));
+
+        emit({ progress: 100, text: "Download complete!", downloadUrl: `/api/download-file?key=${cacheKey}&ext=${ext}&title=${encodeURIComponent(title as string || "video")}` });
+        done();
+
       } else {
-        console.warn(`yt-dlp exited with non-zero code: ${code}`);
-        const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
-        if (isYoutube && !res.writableEnded) {
-          runLoaderToFallback();
-        } else if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ error: `Download failed with exit code ${code}` })}\n\n`);
-          res.end();
-        }
+        console.warn(`[yt-dlp] Non-zero exit: ${code}`);
+        if (isYoutube && !res.writableEnded) { runLoaderToFallback(); }
+        else { emit({ error: `Download failed (yt-dlp exit ${code})` }); done(); }
       }
     });
 
-    // ─── FIX 4: Only kill yt-dlp if it HASN'T finished yet ─────────────────
     req.on("close", () => {
       if (!processFinished && ytdlp) {
-        console.log("Client disconnected mid-download — killing yt-dlp");
+        console.log("Client disconnected — killing yt-dlp");
         ytdlp.kill("SIGKILL");
       }
     });
 
   } catch (err: any) {
-    console.error("Prepare stream general error:", err);
-    const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
-    if (isYoutube && !res.writableEnded) {
-      await runLoaderToFallback();
-    } else if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ error: err.message || "Failed to initiate download process" })}\n\n`);
-      res.end();
-    }
+    console.error("prepare-stream error:", err);
+    if (isYoutube && !res.writableEnded) { await runLoaderToFallback(); }
+    else { emit({ error: err.message || "Failed to start download" }); done(); }
   }
 });
+
 
 // ─── Download file endpoint ───────────────────────────────────────────────────
 app.get("/api/download-file", (req, res) => {
