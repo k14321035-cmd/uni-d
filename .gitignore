@@ -6,16 +6,3 @@ coverage/
 *.log
 .env*
 !.env.example
-
-# yt-dlp binaries (downloaded automatically at server start)
-yt-dlp
-yt-dlp.exe
-yt-dlp-nightly
-
-# Downloaded media files
-downloads/
-
-# Large media files accidentally left in root
-*.webm
-*.mp4
-*.mp3
